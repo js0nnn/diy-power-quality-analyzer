@@ -37,13 +37,53 @@ No PCB was ordered for this. The ADE9000 is a fine-pitch SMD part, **hand-solder
 
 ## In action
 
-| 20x4 LCD on the prototype | Live waveforms in the GUI |
-|---|---|
-| <img src="docs/lcd.jpg" alt="20x4 LCD showing Phase A instantaneous values: 248.7 V, 0.04 A, PF 0.121, 0.5 W"/> | <img src="docs/gui_main.png" alt="Python GUI showing live voltage and current waveforms with RMS, power and THD readouts"/> |
+| Boot splash | Menu (rotary encoder) | Live values |
+|---|---|---|
+| <img src="docs/measurements/lcd_splash.jpg" width="300" alt="20x4 LCD boot splash reading POWER QUALITY MONITOR"/> | <img src="docs/measurements/lcd_menu.jpg" width="300" alt="20x4 LCD main menu with Inst Values selected, then Power Comp and Power Quality"/> | <img src="docs/lcd.jpg" width="300" alt="20x4 LCD showing Phase A instantaneous values: 248.7 V, 0.04 A, PF 0.121, 0.5 W"/> |
 
-<p align="center">
-  <img src="docs/gui_harmonics.png" width="90%" alt="Harmonic spectrum and voltage/current distribution histograms in the Python GUI"/>
-</p>
+## Measurements
+
+Real loads on single-phase 230 V mains, captured with the analyzer and the Python GUI. In the waveform plots, **yellow is voltage (VA)** and **cyan is current (IA)** in raw ADE9000 codes, about six and a half mains cycles per screen. The harmonic plots show the **current spectrum up to the 15th harmonic**, as a percentage of the fundamental.
+
+| Load | Type | V<sub>RMS</sub> (V) | I<sub>RMS</sub> (A) | P (W) | Q (VAR) | S (VA) | PF | V<sub>THD</sub> (%) | I<sub>THD</sub> (%) |
+|---|---|---|---|---|---|---|---|---|---|
+| [Oven](#oven-12-kw-resistive) | resistive, ~1.2 kW | 235.99 | 5.24 | 1237.14 | 30.82 | 1237.53 | **0.9997** | 4.53 | **5.57** |
+| [Laptop charger](#laptop-charger-100-w-non-linear) | non-linear (SMPS), ~100 W | 241.51 | 0.46 | 88.99 | 66.66 | 111.19 | **0.8004** | 3.48 | **69.40** |
+| [Mixer grinder](#mixer-grinder-130-w-motor) | motor, ~130 W | 241.72 | 0.54 | 129.02 | 25.13 | 131.44 | **0.9815** | 3.66 | **16.79** |
+
+The supply voltage itself is visibly flat-topped (V<sub>THD</sub> 3.5 to 4.5 %) in every capture, which is what a mains feed shared with many rectifier loads typically looks like.
+
+### Oven (~1.2 kW, resistive)
+
+Current follows voltage almost perfectly: PF 0.9997 and only small 5th and 7th harmonics, which come from the distorted supply rather than the load.
+
+| Waveforms | Current harmonics |
+|---|---|
+| <img src="docs/measurements/oven_waves.png" alt="Oven: voltage and current in phase, VRMS 235.99 V, IRMS 5.24 A, PF 0.9997, P 1237.14 W, VTHD 4.53 %, ITHD 5.57 %"/> | <img src="docs/measurements/oven_harmonics.png" alt="Oven current spectrum: fundamental only, with about 1.5 % at the 5th and 7th harmonics"/> |
+
+### Laptop charger (~100 W, non-linear)
+
+The switch-mode supply only draws current near the voltage peaks, so the current is a narrow, spiky pulse. That gives the classic rectifier spectrum: a large **3rd harmonic (about 34 %)**, a strong 5th, and odd harmonics out to the 15th, for **69 % current THD**.
+
+| Waveforms | Current harmonics |
+|---|---|
+| <img src="docs/measurements/laptop_waves.png" alt="Laptop charger: spiky current pulses at the voltage peaks, VRMS 241.51 V, IRMS 0.46 A, PF 0.8004, ITHD 69.40 %"/> | <img src="docs/measurements/laptop_harmonics.png" alt="Laptop charger current spectrum: 3rd harmonic about 34 %, 5th about 10 %, smaller odd harmonics up to the 15th"/> |
+
+### Mixer grinder (~130 W, motor)
+
+The universal motor draws a roughly sinusoidal current with commutator ripple on top: PF 0.98 and a moderate **3rd harmonic (about 8 %)**, for about **17 to 20 % current THD**.
+
+| Waveforms | Current harmonics |
+|---|---|
+| <img src="docs/measurements/grinder_waves.png" alt="Mixer grinder: near-sinusoidal current with ripple, VRMS 241.72 V, IRMS 0.54 A, PF 0.9815, ITHD 16.79 %"/> | <img src="docs/measurements/grinder_harmonics.png" alt="Mixer grinder current spectrum: 3rd harmonic about 8 %, 5th about 4 %, small higher harmonics"/> |
+
+### Voltage events
+
+The GUI flags out-of-range supply voltage by colouring the reading: **undervoltage** below 200 V<sub>RMS</sub> / 280 V<sub>PEAK</sub>, **overvoltage** above 250 V<sub>RMS</sub> / 350 V<sub>PEAK</sub>.
+
+| Undervoltage: 165.69 V<sub>RMS</sub>, 232.14 V<sub>PEAK</sub> | Overvoltage: 276.90 V<sub>RMS</sub>, 391.96 V<sub>PEAK</sub> |
+|---|---|
+| <img src="docs/measurements/undervoltage.png" alt="Undervoltage capture: VRMS 165.69 V and VPEAK 232.14 V highlighted in blue"/> | <img src="docs/measurements/overvoltage.png" alt="Overvoltage capture: VRMS 276.90 V and VPEAK 391.96 V highlighted in red"/> |
 
 ## Hardware architecture
 
