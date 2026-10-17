@@ -1,4 +1,5 @@
 /* USER CODE BEGIN Header */
+//CM7
 /**
   ******************************************************************************
   * @file           : main.c
@@ -18,15 +19,22 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "openamp.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ade9000.h"
-#include "pqa_params.h"
+#include <math.h>
 
+
+#define ALPHA 0.2   // smoothing factor
+//#include "lwip/apps/httpd.h"
+
+#include "shared_mem.h"
 
 #define ENABLE_LOG 1
 #include "redirect.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,21 +44,37 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define WAVE_SAMPLES 256
-#define WAVEFORM_BUFFER_SIZE 512
-#define SPI_RX_BUFFER_SIZE WAVEFORM_BUFFER_SIZE * 4
+
+
+#define ADE9000_PCF_FS_CODES 74532013.0f
+
+#define ADE9000_FS_VOLTAGE 1.0f
+#define VOLTAGE_TR 1001.0f
+
+#define V_FS (ADE9000_FS_VOLTAGE * VOLTAGE_TR)
+
+#define ADC_FS_RMS_VOLTAGE 0.1765f
+#define ROGOWSKI_SENSITIVITY 194e-6f
+#define CURRENT_GAIN 1.42f
+
+#define I_FS (ADC_FS_RMS_VOLTAGE / ROGOWSKI_SENSITIVITY)
+#define V_CAL  (239.0 / 158.0)   // ≈ 1.51
+#define I_CAL  (5.1   / 3.4)     // ≈ 1.50
+
 
 /* DUAL_CORE_BOOT_SYNC_SEQUENCE: Define for dual core boot synchronization    */
 /*                             demonstration code based on hardware semaphore */
 /* This define is present in both CM7/CM4 projects                            */
-/* To comment when developping/debugging on a single core                     */
-//#define DUAL_CORE_BOOT_SYNC_SEQUENCE
+///* To comment when developping/debugging on a single core                     */
+#define DUAL_CORE_BOOT_SYNC_SEQUENCE
+
 
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
 #ifndef HSEM_ID_0
 #define HSEM_ID_0 (0U) /* HW semaphore 0*/
 #endif
 #endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
+
 
 /* USER CODE END PD */
 
@@ -74,10 +98,14 @@ volatile uint8_t ade_data_ready = 0;
 volatile uint8_t ade_wfb_ready = 0;
 volatile uint8_t waveform_ready = 0;
 volatile uint16_t sample_counter = 0;
-volatile uint8_t spi_busy = 0; // for DMA
+volatile uint8_t spi_busy = 0; // for waveform DMA
+volatile uint8_t uart_tx_busy = 0; // for waveform DMA
+volatile uint8_t phase_ready = 0; // for phase regs DMS
 
 uint32_t waveform[WAVEFORM_BUFFER_SIZE];
-uint8_t spi_rx[SPI_RX_BUFFER_SIZE];
+uint8_t waveform_spi_rx[SPI_RX_BUFFER_SIZE];
+uint8_t phase_spi_rx[ADE9000_BURST_PHASE_A_BYTES];
+//uint32_t phase_regs[ADE9000_BURST_PHASE_A_REG_COUNT];
 
 #pragma pack(push,1)
 typedef struct
@@ -92,34 +120,65 @@ typedef struct
 #pragma pack(pop)
 
 wave_packet_t pkt;
+
+// spi dma mode selection
+typedef enum
+{
+    SPI_IDLE = 0,
+    SPI_WAVEFORM,
+    SPI_PHASE
+} spi_mode_t;
+
+volatile spi_mode_t spi_mode = SPI_IDLE;
+
+
+
+phase_shared_t *phase_shared = PHASE_SHARED_ADDR;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 uint16_t crc16_ccitt(uint8_t *data, uint32_t len);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+//void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
+//{
+//    LOG("ETH RX IRQ\r\n");
+//}
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 	if (GPIO_Pin == ADE9000_DREADY_INT_Pin)
 	{
 		sample_counter++;
-//		if(sample_counter >= 160) {
-		if(sample_counter >= 1000) {
+		if(sample_counter >= 160) {
 			sample_counter = 0;
 			ade_data_ready = 1;
 		}
-	}	else if (GPIO_Pin == ADE9000_IRQ0_INT_Pin) {
+	}	else if (GPIO_Pin == ADE9000_IRQ0_Pin) {
 		ade_wfb_ready = 1;
 	}
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if(huart->Instance == USART3)
+    {
+        uart_tx_busy = 0;
+        LOG("\r\n\r\nUART3 DMA CallBack Received\r\n\r\n");
+    }
 }
 
 
@@ -127,35 +186,33 @@ void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     if (hspi->Instance == SPI1)
     {
-//         Release ADE9000 chip select
         HAL_GPIO_WritePin(ADE9000_SPI1_CS_GPIO_Port,
                           ADE9000_SPI1_CS_Pin,
                           GPIO_PIN_SET);
 
-//         Convert raw SPI bytes → 32-bit samples
-        for (int i = 0; i < WAVEFORM_BUFFER_SIZE; i++)
+        if(spi_mode == SPI_WAVEFORM)
         {
-            waveform[i] =
-                ((uint32_t)spi_rx[i*4] << 24) |
-                ((uint32_t)spi_rx[i*4+1] << 16) |
-                ((uint32_t)spi_rx[i*4+2] << 8) |
-                ((uint32_t)spi_rx[i*4+3]);
+//            ade9000_parse_burst_block(waveform_spi_rx, WAVEFORM_BUFFER_SIZE, waveform);
+//
+////            ade9000_write(ade_dev, ADE9000_REG_STATUS0, ADE9000_STATUS0_PAGE_FULL);
+//            uint32_t status0;
+//            ade9000_read(ade_dev, ADE9000_REG_STATUS0, &status0);
+//
+//            // Clear ALL active flags
+//            ade9000_write(ade_dev, ADE9000_REG_STATUS0, status0);
+
+            waveform_ready = 1;
+        }
+        else if(spi_mode == SPI_PHASE)
+        {
+//            ade9000_parse_burst_block(phase_spi_rx, ADE9000_BURST_PHASE_A_REG_COUNT, phase_shared->phase_regs);
+//
+//            phase_shared->new_data = 1;
+						phase_ready = 1;
         }
 
-//        LOG("\r\nDMA Complete\r\n", i);
-
-        // reset status flag
-				ade9000_write(ade_dev, ADE9000_REG_STATUS0, ADE9000_STATUS0_PAGE_FULL);
-//        uint32_t status;
-//        ade9000_read(ade_dev, ADE9000_REG_STATUS0, &status);
-//        ade9000_write(ade_dev, ADE9000_REG_STATUS0, status);
-				// restart
-//				ade9000_update_bits(ade_dev, ADE9000_REG_WFB_CFG, ADE9000_WF_CAP_EN, ADE9000_WF_CAP_EN);
-
-        waveform_ready = 1;
         spi_busy = 0;
-
-
+        spi_mode = SPI_IDLE;
     }
 }
 
@@ -177,8 +234,100 @@ void ade_write_debug(struct ade9000_dev *dev, char *reg_name, uint16_t reg_addr,
 
 
 
+void compute_parameters(int32_t *va_raw,
+                        int32_t *ia_raw,
+                        uint16_t N,
+                        power_params_t *out)
+{
+    static double v[WAVE_SAMPLES];
+    static double i[WAVE_SAMPLES];
 
+    static double vrms_f = 0;
+    static double irms_f = 0;
+    static double p_real_f = 0;
+    static double pf_f = 0;
 
+    double mean_v = 0, mean_i = 0;
+
+    /* -------- SCALE -------- */
+    for(int k = 0; k < N; k++)
+    {
+				v[k] = ((double)va_raw[k] / ADE9000_PCF_FS_CODES) * V_FS * V_CAL;
+				i[k] = ((double)ia_raw[k] / ADE9000_PCF_FS_CODES) * I_FS * CURRENT_GAIN * I_CAL;
+
+        mean_v += v[k];
+        mean_i += i[k];
+    }
+
+    mean_v /= N;
+    mean_i /= N;
+
+    /* -------- REMOVE DC -------- */
+    for(int k = 0; k < N; k++)
+    {
+        v[k] -= mean_v;
+        i[k] -= mean_i;
+    }
+
+    /* -------- HANN WINDOW (stability boost) -------- */
+    for(int k = 0; k < N; k++)
+    {
+        double w = 0.5 * (1.0 - cos(2.0 * M_PI * k / (N - 1)));
+        v[k] *= w;
+        i[k] *= w;
+    }
+
+    /* -------- RMS + POWER -------- */
+    double sum_v2 = 0, sum_i2 = 0, sum_p = 0;
+    double vpeak = 0, ipeak = 0;
+
+    for(int k = 0; k < N; k++)
+    {
+        double vk = v[k];
+        double ik = i[k];
+
+        sum_v2 += vk * vk;
+        sum_i2 += ik * ik;
+
+        double p = vk * ik;
+        sum_p += p;
+
+        double av = fabs(vk);
+        double ai = fabs(ik);
+
+        if(av > vpeak) vpeak = av;
+        if(ai > ipeak) ipeak = ai;
+    }
+
+    double vrms = sqrt(sum_v2 / N);
+    double irms = sqrt(sum_i2 / N);
+    double p_real = sum_p / N;
+    double p_app = vrms * irms;
+
+    double pf = (p_app > 1e-9) ? (p_real / p_app) : 0;
+    double p_reactive = sqrt(fmax(p_app*p_app - p_real*p_real, 0));
+
+    /* -------- EXPONENTIAL SMOOTHING -------- */
+    vrms_f = ALPHA * vrms + (1.0 - ALPHA) * vrms_f;
+    irms_f = ALPHA * irms + (1.0 - ALPHA) * irms_f;
+    p_real_f = ALPHA * p_real + (1.0 - ALPHA) * p_real_f;
+    pf_f = ALPHA * pf + (1.0 - ALPHA) * pf_f;
+
+    double p_app_f = vrms_f * irms_f;
+    double p_reactive_f = sqrt(fmax(p_app_f*p_app_f - p_real_f*p_real_f, 0));
+
+    /* -------- OUTPUT -------- */
+    out->vrms = vrms_f;
+    out->irms = irms_f;
+    out->pf = pf_f;
+    out->p_app = p_app_f;
+    out->p_real = p_real_f;
+    out->p_reactive = p_reactive_f;
+    out->vthd = 0;   // still TODO
+    out->ithd = 0;
+    out->vpeak = vpeak;
+    out->ipeak = ipeak;
+}
 
 
 /* USER CODE END 0 */
@@ -199,10 +348,8 @@ int main(void)
 #endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
 /* USER CODE END Boot_Mode_Sequence_0 */
 
-  /* Enable the CPU Cache */
-
-  /* Enable I-Cache---------------------------------------------------------*/
-  SCB_EnableICache();
+  /* MPU Configuration--------------------------------------------------------*/
+  MPU_Config();
 
 /* USER CODE BEGIN Boot_Mode_Sequence_1 */
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
@@ -227,8 +374,6 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 /* USER CODE BEGIN Boot_Mode_Sequence_2 */
-/* Clear the CM7 -> CM4 parameter block before the CM4 is released */
-pqa_shared_init();
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
 /* When system initialization is finished, Cortex-M7 will release Cortex-M4 by means of
 HSEM notification */
@@ -249,7 +394,8 @@ Error_Handler();
 /* USER CODE END Boot_Mode_Sequence_2 */
 
   /* USER CODE BEGIN SysInit */
-
+/* Debug halt */
+//__BKPT(0);
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -259,6 +405,7 @@ Error_Handler();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  phase_shared->new_data = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -266,6 +413,7 @@ Error_Handler();
   HAL_Delay(2000);
 	// Power-up sequence
 	LOG("\r\nPERFORMING POWERUP SEQUENCE\r\n");
+
 	HAL_GPIO_WritePin(ADE9000_PM1_GPIO_Port, ADE9000_PM1_Pin, GPIO_PIN_RESET);
 	HAL_GPIO_WritePin(ADE9000_RESET_GPIO_Port, ADE9000_RESET_Pin, GPIO_PIN_RESET);
 	HAL_Delay(1000);
@@ -289,7 +437,6 @@ Error_Handler();
 	{
 		LOG("ADE9000 INIT FAILED: %d\r\n", ret);
 	}
-	PQA_SHARED->ade_ok = (ret == 0);
 
 	ret = ade9000_setup(ade_dev);
 	if(ret == 0)
@@ -317,28 +464,6 @@ Error_Handler();
 	ade_write_debug(ade_dev, "WFB_TRG_CFG", ADE9000_REG_WFB_TRG_CFG, reg);
 
 	/*using Continuous Fill Mode*/
-//	uint32_t reg = 0;
-//	reg |= ADE9000_WF_CAP_SEL;
-//	reg |= no_os_field_prep(ADE9000_WF_MODE, 2);
-//	ade_write_debug(ade_dev, "WFB_CONFIG", ADE9000_REG_WFB_CFG, reg);
-//
-//	// Enable PAGE FULL Interrupt
-//	reg = 0;
-//	reg |= ADE9000_MASK0_PAGE_FULL;
-//	ade_write_debug(ade_dev, "MASK0", ADE9000_REG_MASK0, reg);
-//
-//	reg = 0;
-//	reg |= ADE9000_WF_CAP_SEL;
-//	reg |= no_os_field_prep(ADE9000_WF_MODE, 2);
-//	reg |= no_os_field_prep(ADE9000_WF_SRC, ADE9000_SRC_SINC4_IIR);
-//	reg |= ADE9000_WF_CAP_EN;
-//	ade_write_debug(ade_dev, "WFB_CONFIG", ADE9000_REG_WFB_CFG, reg);
-//
-//	ade_write_debug(ade_dev, "WFB_PG_IRQEN", ADE9000_REG_WFB_PG_IRQEN, 0x0001);
-
-
-	/*using Stop When Buffer Is Full Mode*/
-
 	reg |= ADE9000_WF_CAP_SEL;
 	reg |= no_os_field_prep(ADE9000_WF_MODE, ADE9000_MODE_SAVE_EVENT_ADDR);
 	ade_write_debug(ade_dev, "WFB_CONFIG", ADE9000_REG_WFB_CFG, reg);
@@ -367,12 +492,7 @@ Error_Handler();
 	uint32_t pga;
 	ade9000_read(ade_dev, ADE9000_REG_PGA_GAIN, &pga);
 	LOG("PGA_GAIN register = 0x%08lX\r\n", pga);
-
-
-	HAL_Delay(2000);
-
-
-
+	HAL_Delay(1000);
 
 
 
@@ -383,38 +503,51 @@ Error_Handler();
 
     /* USER CODE BEGIN 3 */
 
-/*  	if(ade_dev && ade_data_ready)
+  	// blink led periodically periodically
+  	static uint32_t last_print = 0;
+  	if (HAL_GetTick() - last_print > 2000) // every 2 sec
   	{
-  	    ade_data_ready = 0;
+  	    last_print = HAL_GetTick();
 
-  	    ade9000_read_data_ph(ade_dev, ADE9000_PHASE_A);
-  	    LOG("%lu\t%lu mV\t%lu\t%lu mA\r\n",
-  	    		ade_dev->vrms_raw_adc,ade_dev->vrms_val,
-  	    		ade_dev->irms_raw_adc,ade_dev->irms_val);
-  	}*/
+  	    HAL_GPIO_TogglePin(CM7_LD1_GPIO_Port, CM7_LD1_Pin);
+  	}
 
-  	if(waveform_ready)
-  	{
-  		waveform_ready = 0;
-//  		LOG("i\tIA\tVA\tIB\tVB\tIC\tVC\tIN\r\n");
-//			for(int i = 0; i < 256; i++)
-//			{
-//				LOG("%d\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\r\n",
-//								i,
-//							 (int32_t)waveform[i*8], (int32_t)waveform[i*8+1],
-//							 (int32_t)waveform[i*8+2], (int32_t)waveform[i*8+3],
-//							 (int32_t)waveform[i*8+4], (int32_t)waveform[i*8+5],
-//							 (int32_t)waveform[i*8+6]);
-//			}
 
-//			LOG("i\tIA\tVA\r\n");
-//			for(int i = 0; i < 256; i++)
-//			{
-//				LOG("%d\t%ld\t%ld\r\n",
-//								i,
-//							 (int32_t)waveform[i*2], (int32_t)waveform[i*2+1]);
-//			}
 
+
+  	/* ---------- Waveform DMA trigger ---------- */
+
+		if(ade_wfb_ready)
+		{
+				ade_wfb_ready = 0;
+
+
+				if(!spi_busy)
+				{
+						spi_busy = 1;
+						spi_mode = SPI_WAVEFORM;
+
+						ade9000_wfb_burst_read_DMA(ade_dev,
+																			 WAVEFORM_BUFFER_SIZE,
+																			 waveform_spi_rx);
+				}
+		}
+
+		/* ---------- Send waveform ---------- */
+
+		if(waveform_ready)
+		{
+				waveform_ready = 0;
+
+				// Parse data OUTSIDE ISR
+				ade9000_parse_burst_block(waveform_spi_rx,
+																	WAVEFORM_BUFFER_SIZE,
+																	waveform);
+
+				// Clear ADE interrupt OUTSIDE ISR
+				uint32_t status0;
+				ade9000_read(ade_dev, ADE9000_REG_STATUS0, &status0);
+				ade9000_write(ade_dev, ADE9000_REG_STATUS0, status0);
 
 				pkt.header = 0xAA55;
 				pkt.frame_id = i++;
@@ -422,70 +555,77 @@ Error_Handler();
 
 				for(int j = 0; j < WAVE_SAMPLES; j++)
 				{
-//  	        pkt.ia[j] = (int32_t)waveform[j*2] >> 4;
-//  	        pkt.va[j] = (int32_t)waveform[j*2+1] >> 4;
-					pkt.ia[j] = (int32_t)waveform[j*2];
-					pkt.va[j] = (int32_t)waveform[j*2+1];
+						pkt.ia[j] = (int32_t)waveform[j*2];
+						pkt.va[j] = (int32_t)waveform[j*2+1];
 				}
+
+				power_params_t params;
+
+				compute_parameters(pkt.va, pkt.ia, WAVE_SAMPLES, &params);
+				phase_shared->params_ready = 0;   // clear first
+				phase_shared->params = params;    // copy struct
+				phase_shared->params_ready = 1;   // signal done
+
+
+
+//				LOG("VRMS=%.2f IRMS=%.2f PF=%.3f P=%.2f VA=%.2f Q=%.2f VTHD=%.2f%% ITHD=%.2f%%\r\n",
+//				        params.vrms,
+//				        params.irms,
+//				        params.pf,
+//				        params.p_real,
+//				        params.p_app,
+//				        params.p_reactive,
+//				        params.vthd * 100.0f,
+//				        params.ithd * 100.0f
+//				    );
 
 				pkt.crc = crc16_ccitt((uint8_t*)&pkt, sizeof(pkt) - 2);
 
-//				LOG("packet size = %d\r\n", sizeof(pkt));
-
-				HAL_UART_Transmit(&huart3, (uint8_t*)&pkt, sizeof(pkt), HAL_MAX_DELAY);
-
-				/* Publish V, I, P, Q, S, PF, THD and peaks for the CM4 LCD, about 4x per second */
-				static uint32_t last_publish = 0;
-				if (HAL_GetTick() - last_publish >= 250)
+				if(!uart_tx_busy)
 				{
-					last_publish = HAL_GetTick();
-					pqa_params_t params;
-					pqa_compute(pkt.ia, pkt.va, WAVE_SAMPLES, &params);
-					pqa_shared_publish(&params);
+						uart_tx_busy = 1;
+						HAL_UART_Transmit_DMA(&huart3,
+																	(uint8_t*)&pkt,
+																	sizeof(pkt));
 				}
+		}
+
+		/* ---------- Phase register read ---------- */
+
+		if(ade_dev && ade_data_ready && !spi_busy)
+		{
+				ade_data_ready = 0;
+
+				spi_busy = 1;
+				spi_mode = SPI_PHASE;
+
+				ade9000_phase_block_read_DMA(ade_dev, phase_spi_rx);
+		}
+//  	if(ade_data_ready) {
+//  		ade_data_ready = 0;
+//  		ade9000_read_data_ph(ade_dev, ADE9000_PHASE_A);
+//
+//  						LOG("%d\t%lu\t%lu\t%lu\t%lu\r\n",
+//  								i++,
+//  								ade_dev->vrms_raw_adc, ade_dev->vrms_val,
+//  								ade_dev->irms_raw_adc, ade_dev->irms_val);
+//
+//
+//  	}
 
 
-//				HAL_Delay(1000);
+		/* ---------- Process phase data ---------- */
 
+		if(phase_ready)
+		{
+		    phase_ready = 0;
 
-  	}
+		    ade9000_parse_burst_block(phase_spi_rx,
+		                              ADE9000_BURST_PHASE_A_REG_COUNT,
+		                              phase_shared->phase_regs);
 
-  	if(ade_wfb_ready)
-  	{
-  	    ade_wfb_ready = 0;
-//  	    LOG("\r\nINTR: Waveform page ready!\r\n", i);
-
-//  	    ade9000_update_bits(ade_dev, ADE9000_REG_WFB_CFG, ADE9000_WF_CAP_EN, 0);        // stop capture
-/*  	    ade9000_wfb_burst_read(ade_dev,WAVEFORM_BUFFER_SIZE, spi_rx, waveform);
-
-  	    LOG("i\tIA\tVA\tIB\tVB\tIC\tVC\tIN\r\n");
-				for(int i = 0; i < 256; i++)
-				{
-						LOG("%d\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\r\n",
-										i,
-									 (int32_t)waveform[i*8], (int32_t)waveform[i*8+1],
-									 (int32_t)waveform[i*8+2], (int32_t)waveform[i*8+3],
-									 (int32_t)waveform[i*8+4], (int32_t)waveform[i*8+5],
-									 (int32_t)waveform[i*8+6]);
-				}
-
-				HAL_Delay(1000);
-
-  	    // reset status flag
-				ade9000_write(ade_dev, ADE9000_REG_STATUS0, ADE9000_STATUS0_PAGE_FULL);*/
-//  	    restart
-//				ade9000_update_bits(ade_dev, ADE9000_REG_WFB_CFG, ADE9000_WF_CAP_EN, ADE9000_WF_CAP_EN);
-
-				if(!spi_busy)
-  	    {
-  	        spi_busy = 1;
-//  	        LOG("\r\nPerforming DMA on SPI1\r\n", i);
-  	        ade9000_wfb_burst_read_DMA(ade_dev, WAVEFORM_BUFFER_SIZE, spi_rx);
-  	    }
-
-
-
-  	}
+		    phase_shared->new_data = 1;
+		}
 
   }
   /* USER CODE END 3 */
@@ -658,10 +798,10 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
@@ -729,21 +869,29 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(ADE9000_PM1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : ADE9000_IRQ0_INT_Pin */
-  GPIO_InitStruct.Pin = ADE9000_IRQ0_INT_Pin;
+  /*Configure GPIO pin : PG13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : ADE9000_IRQ0_Pin */
+  GPIO_InitStruct.Pin = ADE9000_IRQ0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(ADE9000_IRQ0_INT_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(ADE9000_IRQ0_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(ADE9000_IRQ0_INT_EXTI_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(ADE9000_IRQ0_INT_EXTI_IRQn);
+  HAL_NVIC_SetPriority(ADE9000_IRQ0_EXTI_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(ADE9000_IRQ0_EXTI_IRQn);
 
-  HAL_NVIC_SetPriority(ADE9000_DREADY_INT_EXTI_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(ADE9000_DREADY_INT_EXTI_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(ADE9000_DREADY_INT_EXTI_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-//  HAL_NVIC_DisableIRQ(ADE9000_IRQ0_INT_EXTI_IRQn);
+//  HAL_NVIC_DisableIRQ(ADE9000_IRQ0_EXTI_IRQn);
 //  HAL_NVIC_DisableIRQ(ADE9000_DREADY_INT_EXTI_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }
@@ -768,7 +916,38 @@ uint16_t crc16_ccitt(uint8_t *data, uint32_t len)
 
     return crc;
 }
+
+
 /* USER CODE END 4 */
+
+ /* MPU Configuration */
+
+void MPU_Config(void)
+{
+  MPU_Region_InitTypeDef MPU_InitStruct = {0};
+
+  /* Disables the MPU */
+  HAL_MPU_Disable();
+
+  /** Initializes and configures the Region and the memory to be protected
+  */
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+  MPU_InitStruct.BaseAddress = 0x38000000;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_64KB;
+  MPU_InitStruct.SubRegionDisable = 0x0;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_ENABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+  /* Enables the MPU */
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.

@@ -57,6 +57,15 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define LCD_SCL_Pin GPIO_PIN_10
+#define LCD_SCL_GPIO_Port GPIOB
+#define LCD_SDA_Pin GPIO_PIN_11
+#define LCD_SDA_GPIO_Port GPIOB
+#define ESP01_RST_Pin GPIO_PIN_7
+#define ESP01_RST_GPIO_Port GPIOD
+#define ENCODER_SW_Pin GPIO_PIN_14
+#define ENCODER_SW_GPIO_Port GPIOG
+#define ENCODER_SW_EXTI_IRQn EXTI15_10_IRQn
 
 /* USER CODE BEGIN Private defines */
 

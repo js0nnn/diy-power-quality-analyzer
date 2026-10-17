@@ -25,12 +25,13 @@ No PCB was ordered for this. The ADE9000 is a fine-pitch SMD part, **hand-solder
 
 - **Hand-soldered SMD ADE9000** on a breakout, analog front end built point-to-point on zero PCB
 - **Isolated SPI** between the live side (ADE9000) and the safe side (STM32)
-- **Dual-core STM32H755**: Cortex-M7 runs acquisition and maths, Cortex-M4 runs the LCD and encoder UI
-- **Lock-free CM7 → CM4 hand-off** through shared SRAM4 using a sequence counter
+- **Dual-core STM32H755**: Cortex-M7 runs acquisition and maths, Cortex-M4 runs the LCD, encoder and Wi-Fi
+- **CM7 → CM4 hand-off** through shared, non-cacheable SRAM4 (MPU-configured), with OpenAMP set up on both cores
 - **SPI DMA burst reads** of the ADE9000 waveform buffer, triggered by its page-full interrupt
 - **CRC16-checked binary stream** of current and voltage samples over UART at **921600 baud**
-- **On-device maths**: RMS, P, Q, S, PF, peaks and Hann-windowed THD, a C port of the GUI's numpy code that matches it to within 4 ppm
+- **On-device maths** on CM7: RMS, P, Q, S, PF and peaks with calibration and smoothing; THD straight from the ADE9000's own registers
 - **20x4 LCD + rotary encoder** with Instant values, Power components, Power quality and Diagnostics pages
+- **MQTT over Wi-Fi** through an ESP-01 (ESP8266 AT firmware), publishing all readings once a second
 - **Python GUI** with live waveforms, RMS, power, PF, THD, harmonic spectrum and histograms
 - Measured on the prototype: about **1% voltage** and **5% current** error
 
@@ -65,30 +66,36 @@ The analog front end follows Analog Devices' **[EVAL-ADE9000-Shield](https://www
   <img src="docs/sw_block_diagram.png" width="75%" alt="Software block diagram: CM7 runs the ADE9000 driver, SPI DMA, waveform buffer and UART; CM4 handles LCD, rotary encoder, ESP8266 MQTT and display logic; CM7 streams to the Python visualizer at 921600 baud."/>
 </p>
 
-<sub>The diagram shows the full target design. The ESP8266/MQTT link is still on the roadmap, see [Status](#status).</sub>
-
 ### Data path
 
 ```text
-ADE9000 waveform buffer ──page-full IRQ──▶ CM7
-CM7 ──SPI1 DMA burst read──▶ 256 × (IA, VA) samples
-CM7 ──pack + CRC16-CCITT──▶ USART3 @ 921600 baud ──▶ visualizer.py (plots, harmonics)
-CM7 ──pqa_compute() every 250 ms──▶ SRAM4 (seqlock) ──▶ CM4 ──I2C2──▶ 20x4 LCD
+ADE9000 waveform buffer ──page-full IRQ──▶ CM7 ──SPI1 DMA burst read──▶ 256 × (IA, VA) samples
+CM7 ──CRC16 packet, UART DMA──▶ USART3 @ 921600 baud ──▶ visualizer.py (plots, harmonics)
+CM7 ──compute_parameters()──▶ SRAM4 phase_shared.params ──┐
+ADE9000 phase registers ──SPI1 DMA──▶ SRAM4 phase_regs ───┴──▶ CM4 ──I2C2──▶ 20x4 LCD
+                                                                 CM4 ──USART2──▶ ESP-01 ──MQTT──▶ broker
 ```
 
-### LCD and encoder wiring
+### Wiring (NUCLEO-H755ZI-Q)
 
-The UI pins live in [`CM4/Core/Inc/ui.h`](ADE9000_PQA/CM4/Core/Inc/ui.h). They are all on the NUCLEO's Zio connectors; change them there if your board is wired differently.
-
-| Signal | Pin | Peripheral |
+| Signal | Pin | Core |
 |---|---|---|
-| LCD SDA | PF0 | I2C2, AF4 |
-| LCD SCL | PF1 | I2C2, AF4 |
-| Encoder A | PD12 | TIM4 CH1, AF2 |
-| Encoder B | PD13 | TIM4 CH2, AF2 |
-| Encoder push button | PG2 | EXTI2, active low |
+| ADE9000 SPI SCK / MISO / MOSI / CS | PA5 / PA6 / PB5 / PD14 | CM7 |
+| ADE9000 IRQ0 / DREADY / RESET / PM1 | PB8 / PE11 / PD15 / PG9 | CM7 |
+| Waveform stream (ST-LINK VCP) | USART3, PD8 / PD9 | CM7 |
+| LCD SDA / SCL (PCF8574 backpack, 0x27) | PB11 / PB10, I2C2 | CM4 |
+| Encoder A / B | PB6 / PB7, TIM4 | CM4 |
+| Encoder push button | PG14, EXTI | CM4 |
+| ESP-01 TX / RX / RST | PD5 / PD6 / PD7, USART2 | CM4 |
 
-The LCD is a 20x4 HD44780 with a PCF8574 I2C backpack; the driver finds it at `0x27` or `0x3F` automatically. Turn the encoder to scroll, press to open the menu or pick a page.
+### MQTT
+
+Readings go to topic `meter/data` once a second as `#`-separated values:
+
+```text
+V#I#PF#S#P#Q#VTHD#ITHD#VPEAK#IPEAK
+%.1f#%.2f#%.2f#%.0f#%.0f#%.0f#%.2f#%.2f#%.0f#%.2f   (THD in %)
+```
 
 ### UART packet
 
@@ -107,9 +114,10 @@ The LCD is a 20x4 HD44780 with a PCF8574 I2C backpack; the driver finds it at `0
 ```text
 .
 ├── ADE9000_PQA/            STM32CubeIDE dual-core project
-│   ├── CM7/                acquisition + pqa_params.c maths (ADE9000 driver in CM7/Drivers/ade9000_drivers)
-│   ├── CM4/                ui.c pages and menu, lcd_i2c.c PCF8574 LCD driver
-│   ├── Common/             dual-core boot code, Inc/shared_mem.h (CM7 → CM4 contract)
+│   ├── CM7/                acquisition, compute_parameters(), waveform stream, MPU setup
+│   ├── CM4/                LCD pages + menu, encoder, ESP8266 Wi-Fi + MQTT (Drivers/i2c_lcd)
+│   ├── Common/Src/         ade9000_drivers/, esp01_drivers/, shared_mem.h, dual-core boot code
+│   ├── Middlewares/        OpenAMP
 │   └── ADE9000_PQA.ioc     CubeMX configuration
 ├── visualizer_gui/         Python + PyQt6 real-time GUI
 ├── docs/                   photos and diagrams
@@ -119,9 +127,10 @@ The LCD is a 20x4 HD44780 with a PCF8574 I2C backpack; the driver finds it at `0
 ## Build and flash
 
 1. Open `ADE9000_PQA` in **STM32CubeIDE** (File → Import → Existing Projects, tick both CM7 and CM4).
-   The UI peripherals (I2C2, TIM4, EXTI2) are set up in `ui.c`, not in the `.ioc`, so regenerating code from CubeMX keeps them. If CubeMX regenerates `CM4/Core/Inc/stm32h7xx_hal_conf.h`, re-enable `HAL_TIM_MODULE_ENABLED` there.
-2. Build **ADE9000_PQA_CM7** and **ADE9000_PQA_CM4**.
-3. Flash both cores to the NUCLEO-H755ZI-Q.
+2. Create your Wi-Fi config: copy `CM4/Core/Inc/wifi_secrets.example.h` to `wifi_secrets.h` in the same folder and fill in your SSID, password and MQTT broker. `wifi_secrets.h` is git-ignored.
+   The encoder timer (TIM4) is initialised in a USER CODE block of the CM4 `main.c`, so CubeMX regeneration keeps it. If CubeMX regenerates `CM4/Core/Inc/stm32h7xx_hal_conf.h`, re-enable `HAL_TIM_MODULE_ENABLED` there.
+3. Build **ADE9000_PQA_CM7** and **ADE9000_PQA_CM4**.
+4. Flash both cores to the NUCLEO-H755ZI-Q.
 
 ## Run the visualizer
 
@@ -137,16 +146,17 @@ python visualizer.py /dev/ttyACM0     # or COM5 on Windows
 | Part | State |
 |---|---|
 | ADE9000 driver, SPI DMA waveform capture, CRC16 UART streaming (CM7) | ✅ |
-| On-device RMS, P, Q, S, PF, peaks, THD (CM7) | ✅ |
-| CM7 → CM4 shared memory (SRAM4, seqlock) | ✅ |
+| On-device RMS, P, Q, S, PF, peaks with calibration (CM7) | ✅ |
+| THD from ADE9000 phase registers via SPI DMA | ✅ |
+| CM7 → CM4 shared memory (SRAM4) | ✅ |
 | 20x4 LCD + rotary encoder UI, 4 pages + menu (CM4) | ✅ |
+| ESP8266 Wi-Fi + MQTT publishing (CM4) | ✅ |
 | Python visualizer: waveforms, RMS, power, PF, THD, harmonics | ✅ |
-| ESP8266 MQTT telemetry | 🗺️ roadmap (Diagnostics page shows "ESP8266: NOT LINKED") |
-| Phases B and C streaming | 🗺️ roadmap |
+| Phases B and C | 🗺️ roadmap |
 
 ## Built on
 
-- **[ade9000-stm32h755](https://github.com/js0nnn/ade9000-stm32h755)**: my STM32Cube HAL port of the Analog Devices no-OS ADE9000 driver, used here in `CM7/Drivers/ade9000_drivers`
+- **[ade9000-stm32h755](https://github.com/js0nnn/ade9000-stm32h755)**: my STM32Cube HAL port of the Analog Devices no-OS ADE9000 driver, used here in `Common/Src/ade9000_drivers`
 - The visualizer GUI was rapidly prototyped with ChatGPT's help and then tuned for this stream format
 
 ## Third-party code
@@ -154,5 +164,7 @@ python visualizer.py /dev/ttyACM0     # or COM5 on Windows
 | Component | Location | License |
 |---|---|---|
 | STM32H7 HAL, CMSIS | `ADE9000_PQA/Drivers` | see the `LICENSE.txt` files in those folders |
-| ADE9000 no-OS driver (Analog Devices) | `ADE9000_PQA/CM7/Drivers/ade9000_drivers` | BSD-style, see file headers |
-| nanoprintf | `ADE9000_PQA/CM7/Core/Src/nanoprintf.h` | Unlicense or 0BSD |
+| ADE9000 no-OS driver (Analog Devices) | `ADE9000_PQA/Common/Src/ade9000_drivers` | BSD-style, see file headers |
+| OpenAMP / libmetal | `ADE9000_PQA/Middlewares/Third_Party/OpenAMP` | BSD-3-Clause and BSD-2-Clause (SPDX header in each file) |
+| I2C_LCD library (DeepBlueMbedded) | `ADE9000_PQA/CM4/Drivers/i2c_lcd` | see file headers |
+| nanoprintf | `ADE9000_PQA/CM7/Core/Src/nanoprintf.h`, `CM4/Core/Src/nanoprintf.h` | Unlicense or 0BSD |

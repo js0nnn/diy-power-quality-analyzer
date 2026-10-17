@@ -24,6 +24,8 @@
 #include "nanoprintf.h"
 
 extern UART_HandleTypeDef huart3;
+extern volatile uint8_t uart_tx_busy;
+
 
 void uart_printf(const char *fmt, ...)
 {
@@ -38,6 +40,9 @@ void uart_printf(const char *fmt, ...)
 
     if(len > 0)
     {
+
+    	if(uart_tx_busy)
+    	        return;
         HAL_UART_Transmit(&huart3, (uint8_t*)buffer, len, 50);
     }
 }

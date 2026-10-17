@@ -30,6 +30,8 @@
 #include <sys/time.h>
 #include <sys/times.h>
 
+#undef errno
+extern int errno;
 
 /* Variables */
 extern int __io_putchar(int ch) __attribute__((weak));

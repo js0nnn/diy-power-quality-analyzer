@@ -1,3 +1,4 @@
+/*cm7*/
 /*
 ******************************************************************************
 **
@@ -45,12 +46,17 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   RAM_D1 (xrw)   : ORIGIN = 0x24000000, LENGTH =  512K
-  FLASH   (rx)   : ORIGIN = 0x08000000, LENGTH = 1024K    /* Memory is divided. Actual start is 0x08000000 and actual length is 2048K */
+  FLASH  (rx)    : ORIGIN = 0x08000000, LENGTH = 1024K    /* Memory is divided. Actual start is 0x08000000 and actual length is 2048K */
   DTCMRAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 128K
   RAM_D2 (xrw)   : ORIGIN = 0x30000000, LENGTH = 288K
   RAM_D3 (xrw)   : ORIGIN = 0x38000000, LENGTH = 64K
   ITCMRAM (xrw)  : ORIGIN = 0x00000000, LENGTH = 64K
+  OPENAMP_RSC_TAB (xrw) 	: ORIGIN = 0x38000000, LENGTH = 1K
+  OPEN_AMP_SHMEM (xrw) : ORIGIN = 0x38000400, LENGTH = 63K
 }
+
+__OPENAMP_region_start__  = ORIGIN(OPEN_AMP_SHMEM);
+__OPENAMP_region_end__ = ORIGIN(OPEN_AMP_SHMEM) + LENGTH(OPEN_AMP_SHMEM);
 
 /* Sections */
 SECTIONS
@@ -165,6 +171,13 @@ SECTIONS
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
   } >RAM_D1
+  
+  
+    .openamp_section (NOLOAD) : {
+     . = ABSOLUTE(0x38000000);
+     *(.resource_table)  
+  } >OPENAMP_RSC_TAB  AT > FLASH
+  
 
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */
   ._user_heap_stack :
@@ -184,6 +197,7 @@ SECTIONS
     libm.a ( * )
     libgcc.a ( * )
   }
+  
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }

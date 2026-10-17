@@ -22,3 +22,6 @@ Thumbs.db
 # Python
 __pycache__/
 .venv/
+
+# Wi-Fi / MQTT credentials (copy wifi_secrets.example.h)
+wifi_secrets.h
