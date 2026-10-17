@@ -1,0 +1,24 @@
+# STM32CubeIDE
+**/Debug/
+**/Release/
+
+# Build outputs
+*.o
+*.d
+*.su
+*.elf
+*.hex
+*.bin
+*.map
+
+# Eclipse
+.settings/
+.metadata/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+.venv/
