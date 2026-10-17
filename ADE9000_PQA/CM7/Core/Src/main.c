@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ade9000.h"
+#include "pqa_params.h"
 
 
 #define ENABLE_LOG 1
@@ -226,6 +227,8 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 /* USER CODE BEGIN Boot_Mode_Sequence_2 */
+/* Clear the CM7 -> CM4 parameter block before the CM4 is released */
+pqa_shared_init();
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
 /* When system initialization is finished, Cortex-M7 will release Cortex-M4 by means of
 HSEM notification */
@@ -286,6 +289,7 @@ Error_Handler();
 	{
 		LOG("ADE9000 INIT FAILED: %d\r\n", ret);
 	}
+	PQA_SHARED->ade_ok = (ret == 0);
 
 	ret = ade9000_setup(ade_dev);
 	if(ret == 0)
@@ -429,6 +433,16 @@ Error_Handler();
 //				LOG("packet size = %d\r\n", sizeof(pkt));
 
 				HAL_UART_Transmit(&huart3, (uint8_t*)&pkt, sizeof(pkt), HAL_MAX_DELAY);
+
+				/* Publish V, I, P, Q, S, PF, THD and peaks for the CM4 LCD, about 4x per second */
+				static uint32_t last_publish = 0;
+				if (HAL_GetTick() - last_publish >= 250)
+				{
+					last_publish = HAL_GetTick();
+					pqa_params_t params;
+					pqa_compute(pkt.ia, pkt.va, WAVE_SAMPLES, &params);
+					pqa_shared_publish(&params);
+				}
 
 
 //				HAL_Delay(1000);

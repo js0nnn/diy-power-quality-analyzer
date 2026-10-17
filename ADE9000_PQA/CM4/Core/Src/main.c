@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "../../../CM7/Drivers/ade9000_drivers/ade9000.h"
+#include "ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,10 +54,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-struct ade9000_dev *ade_dev = NULL;
 
-uint8_t tx_data[8] = {0xAA, 0x55, 0x12, 0x34, 0xAB, 0xCD, 0x00, 0xFF};
-uint8_t rx_data[8];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,28 +65,7 @@ static void MX_DMA_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void SPI_Loopback_Test()
-{
-    HAL_StatusTypeDef status;
 
-    status = HAL_SPI_TransmitReceive(&hspi1,
-                                     tx_data,
-                                     rx_data,
-                                     sizeof(tx_data),
-                                     HAL_MAX_DELAY);
-
-    if(status != HAL_OK)
-    {
-        printf("SPI Error!\r\n");
-        return;
-    }
-
-    printf("TX   RX\r\n");
-    for(int i = 0; i < sizeof(tx_data); i++)
-    {
-        printf("0x%02X 0x%02X\r\n", tx_data[i], rx_data[i]);
-    }
-}
 /* USER CODE END 0 */
 
 /**
@@ -136,72 +112,17 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_DMA_Init();
   /* USER CODE BEGIN 2 */
-
+  ui_init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-
-	HAL_Delay(1000);
-	// Power-up sequence
-	printf("PERFORMING POWERUP SEQUENCE\r\n");
-	HAL_GPIO_WritePin(ADE9000_PM1_GPIO_Port, ADE9000_PM1_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(ADE9000_RESET_GPIO_Port, ADE9000_RESET_Pin, GPIO_PIN_RESET);
-	HAL_Delay(1000);
-	HAL_GPIO_WritePin(ADE9000_RESET_GPIO_Port, ADE9000_RESET_Pin, GPIO_PIN_SET);
-	HAL_Delay(1000);
-
-	// ADE9000 Init parameters
-	struct ade9000_init_param ade_init = {
-		.hspi = &hspi1,
-		.cs_port = ADE9000_SPI1_CS_GPIO_Port,
-		.cs_pin = ADE9000_SPI1_CS_Pin,
-		.temp_en = true
-	};
-
-	int ret = ade9000_init(&ade_dev, ade_init);
-	if (ret == 0)
-	{
-	  printf("ADE9000 INIT SUCCESS\r\n");
-	}
-	else
-	{
-	  printf("ADE9000 INIT FAILED: %d\r\n", ret);
-	}
-
-
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-//	  printf("CM4 running\r\n");
-//	  SPI_Loopback_Test();
-
-	  uint32_t version = 0;
-
-	  if (ade_dev)
-	  {
-	      if (ade9000_read(ade_dev, ADE9000_REG_CONFIG5, &version) == 0)
-	      {
-	          printf("CONFIG5 = 0x%02lX\r\n", version);
-
-	          if (version == ADE9000_CHIP_ID)
-	              printf("ADE9000 COMMUNICATION OK!\r\n");
-	          else
-	              printf("Wrong Chip ID!\r\n");
-	      }
-	      else
-	      {
-	          printf("SPI Read Failed!\r\n");
-	      }
-	  }
-
-	  HAL_Delay(2000);
-
-
-	  HAL_Delay(1000);
+    ui_task();
   }
   /* USER CODE END 3 */
 }

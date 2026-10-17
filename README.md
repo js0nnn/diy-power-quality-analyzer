@@ -25,9 +25,12 @@ No PCB was ordered for this. The ADE9000 is a fine-pitch SMD part, **hand-solder
 
 - **Hand-soldered SMD ADE9000** on a breakout, analog front end built point-to-point on zero PCB
 - **Isolated SPI** between the live side (ADE9000) and the safe side (STM32)
-- **Dual-core STM32H755**: Cortex-M7 runs acquisition, Cortex-M4 is free for UI and connectivity
+- **Dual-core STM32H755**: Cortex-M7 runs acquisition and maths, Cortex-M4 runs the LCD and encoder UI
+- **Lock-free CM7 → CM4 hand-off** through shared SRAM4 using a sequence counter
 - **SPI DMA burst reads** of the ADE9000 waveform buffer, triggered by its page-full interrupt
 - **CRC16-checked binary stream** of current and voltage samples over UART at **921600 baud**
+- **On-device maths**: RMS, P, Q, S, PF, peaks and Hann-windowed THD, a C port of the GUI's numpy code that matches it to within 4 ppm
+- **20x4 LCD + rotary encoder** with Instant values, Power components, Power quality and Diagnostics pages
 - **Python GUI** with live waveforms, RMS, power, PF, THD, harmonic spectrum and histograms
 - Measured on the prototype: about **1% voltage** and **5% current** error
 
@@ -62,16 +65,30 @@ The analog front end follows Analog Devices' **[EVAL-ADE9000-Shield](https://www
   <img src="docs/sw_block_diagram.png" width="75%" alt="Software block diagram: CM7 runs the ADE9000 driver, SPI DMA, waveform buffer and UART; CM4 handles LCD, rotary encoder, ESP8266 MQTT and display logic; CM7 streams to the Python visualizer at 921600 baud."/>
 </p>
 
-<sub>The diagram shows the full target design. See [Status](#status) for what the published firmware implements today.</sub>
+<sub>The diagram shows the full target design. The ESP8266/MQTT link is still on the roadmap, see [Status](#status).</sub>
 
 ### Data path
 
 ```text
 ADE9000 waveform buffer ──page-full IRQ──▶ CM7
 CM7 ──SPI1 DMA burst read──▶ 256 × (IA, VA) samples
-CM7 ──pack + CRC16-CCITT──▶ USART3 @ 921600 baud ──▶ visualizer.py
-visualizer.py ──▶ RMS, P, Q, S, PF, THD, harmonics, plots
+CM7 ──pack + CRC16-CCITT──▶ USART3 @ 921600 baud ──▶ visualizer.py (plots, harmonics)
+CM7 ──pqa_compute() every 250 ms──▶ SRAM4 (seqlock) ──▶ CM4 ──I2C2──▶ 20x4 LCD
 ```
+
+### LCD and encoder wiring
+
+The UI pins live in [`CM4/Core/Inc/ui.h`](ADE9000_PQA/CM4/Core/Inc/ui.h). They are all on the NUCLEO's Zio connectors; change them there if your board is wired differently.
+
+| Signal | Pin | Peripheral |
+|---|---|---|
+| LCD SDA | PF0 | I2C2, AF4 |
+| LCD SCL | PF1 | I2C2, AF4 |
+| Encoder A | PD12 | TIM4 CH1, AF2 |
+| Encoder B | PD13 | TIM4 CH2, AF2 |
+| Encoder push button | PG2 | EXTI2, active low |
+
+The LCD is a 20x4 HD44780 with a PCF8574 I2C backpack; the driver finds it at `0x27` or `0x3F` automatically. Turn the encoder to scroll, press to open the menu or pick a page.
 
 ### UART packet
 
@@ -90,9 +107,9 @@ visualizer.py ──▶ RMS, P, Q, S, PF, THD, harmonics, plots
 ```text
 .
 ├── ADE9000_PQA/            STM32CubeIDE dual-core project
-│   ├── CM7/                acquisition firmware (ADE9000 driver in CM7/Drivers/ade9000_drivers)
-│   ├── CM4/                second core: ADE9000 SPI bring-up test
-│   ├── Common/             shared dual-core boot code
+│   ├── CM7/                acquisition + pqa_params.c maths (ADE9000 driver in CM7/Drivers/ade9000_drivers)
+│   ├── CM4/                ui.c pages and menu, lcd_i2c.c PCF8574 LCD driver
+│   ├── Common/             dual-core boot code, Inc/shared_mem.h (CM7 → CM4 contract)
 │   └── ADE9000_PQA.ioc     CubeMX configuration
 ├── visualizer_gui/         Python + PyQt6 real-time GUI
 ├── docs/                   photos and diagrams
@@ -102,6 +119,7 @@ visualizer.py ──▶ RMS, P, Q, S, PF, THD, harmonics, plots
 ## Build and flash
 
 1. Open `ADE9000_PQA` in **STM32CubeIDE** (File → Import → Existing Projects, tick both CM7 and CM4).
+   The UI peripherals (I2C2, TIM4, EXTI2) are set up in `ui.c`, not in the `.ioc`, so regenerating code from CubeMX keeps them. If CubeMX regenerates `CM4/Core/Inc/stm32h7xx_hal_conf.h`, re-enable `HAL_TIM_MODULE_ENABLED` there.
 2. Build **ADE9000_PQA_CM7** and **ADE9000_PQA_CM4**.
 3. Flash both cores to the NUCLEO-H755ZI-Q.
 
@@ -118,12 +136,12 @@ python visualizer.py /dev/ttyACM0     # or COM5 on Windows
 
 | Part | State |
 |---|---|
-| ADE9000 driver, SPI DMA waveform capture, CRC16 UART streaming (CM7) | ✅ in this repo |
-| Python visualizer: waveforms, RMS, power, PF, THD, harmonics | ✅ in this repo |
-| CM4 ADE9000 SPI bring-up test | ✅ in this repo |
-| LCD + rotary encoder UI (seen in the photos) | 🧪 ran on the prototype, firmware not published yet |
-| CM7 → CM4 shared memory (SRAM4) | 🗺️ roadmap |
-| ESP8266 MQTT telemetry | 🗺️ roadmap |
+| ADE9000 driver, SPI DMA waveform capture, CRC16 UART streaming (CM7) | ✅ |
+| On-device RMS, P, Q, S, PF, peaks, THD (CM7) | ✅ |
+| CM7 → CM4 shared memory (SRAM4, seqlock) | ✅ |
+| 20x4 LCD + rotary encoder UI, 4 pages + menu (CM4) | ✅ |
+| Python visualizer: waveforms, RMS, power, PF, THD, harmonics | ✅ |
+| ESP8266 MQTT telemetry | 🗺️ roadmap (Diagnostics page shows "ESP8266: NOT LINKED") |
 | Phases B and C streaming | 🗺️ roadmap |
 
 ## Built on
